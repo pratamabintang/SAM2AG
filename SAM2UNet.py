@@ -5,6 +5,7 @@ import timm
 from sam2.build_sam import build_sam2
 from models.grid_attention_layer import GridAttentionBlock2D
 from models.utils import UnetDsv2, UnetUp2_CT, UnetConv2, UnetGridGatingSignal2
+from models.networks_other import init_weights
 from ukan_kan import UkanFeatureMapBlock
 from typing import Optional
 
@@ -241,12 +242,18 @@ class SAM2UNet(nn.Module):
         # self.proj4 = SkipFusion(1152 + topo_channels[3], 64)
     
         # attention blocks
-        self.attentionblock2 = GridAttentionBlock2D(in_channels=filters[1] // self.scale_factor, gating_channels=filters[2] // self.scale_factor,
-                                                    inter_channels=filters[1] // self.scale_factor, sub_sample_factor=attention_dsample, mode=mode)
-        self.attentionblock3 = GridAttentionBlock2D(in_channels=filters[2] // self.scale_factor, gating_channels=filters[3] // self.scale_factor,
-                                                    inter_channels=filters[2] // self.scale_factor, sub_sample_factor=attention_dsample, mode=mode)
-        self.attentionblock4 = GridAttentionBlock2D(in_channels=filters[3] // self.scale_factor, gating_channels=filters[4] // self.scale_factor,
-                                                    inter_channels=filters[3] // self.scale_factor, sub_sample_factor=attention_dsample, mode=mode)
+        self.attentionblock2 = MultiAttentionBlock(in_size=filters[1] // self.scale_factor, gate_size=filters[2] // self.scale_factor,
+                                                    inter_size=filters[1] // self.scale_factor, sub_sample_factor=attention_dsample, nonlocal_mode=mode)
+        self.attentionblock3 = MultiAttentionBlock(in_size=filters[2] // self.scale_factor, gate_size=filters[3] // self.scale_factor,
+                                                    inter_size=filters[2] // self.scale_factor, sub_sample_factor=attention_dsample, nonlocal_mode=mode)
+        self.attentionblock4 = MultiAttentionBlock(in_size=filters[3] // self.scale_factor, gate_size=filters[4] // self.scale_factor,
+                                                    inter_size=filters[3] // self.scale_factor, sub_sample_factor=attention_dsample, nonlocal_mode=mode)
+        # self.attentionblock2 = GridAttentionBlock2D(in_channels=filters[1] // self.scale_factor, gating_channels=filters[2] // self.scale_factor,
+        #                                             inter_channels=filters[1] // self.scale_factor, sub_sample_factor=attention_dsample, mode=mode)
+        # self.attentionblock3 = GridAttentionBlock2D(in_channels=filters[2] // self.scale_factor, gating_channels=filters[3] // self.scale_factor,
+        #                                             inter_channels=filters[2] // self.scale_factor, sub_sample_factor=attention_dsample, mode=mode)
+        # self.attentionblock4 = GridAttentionBlock2D(in_channels=filters[3] // self.scale_factor, gating_channels=filters[4] // self.scale_factor,
+        #                                             inter_channels=filters[3] // self.scale_factor, sub_sample_factor=attention_dsample, mode=mode)
 
         self.up_concat4 = UnetUp2_CT(filters[4] // self.scale_factor, filters[3] // self.scale_factor, is_batchnorm)
         self.up_concat3 = UnetUp2_CT(filters[3] // self.scale_factor, filters[2] // self.scale_factor, is_batchnorm)
@@ -335,3 +342,29 @@ if __name__ == "__main__":
         x_topo = torch.randn(1, 5, 512, 512).to(device)
         out1, out2, out3, out4 = model_custom(x_rgb, x_topo=x_topo)
         print("Explicit two-stream forward outputs:", out1.shape, out2.shape, out3.shape, out4.shape)
+
+
+class MultiAttentionBlock(nn.Module):
+    def __init__(self, in_size, gate_size, inter_size, nonlocal_mode, sub_sample_factor):
+        super(MultiAttentionBlock, self).__init__()
+        self.gate_block_1 = GridAttentionBlock2D(in_channels=in_size, gating_channels=gate_size,
+                                                 inter_channels=inter_size, mode=nonlocal_mode,
+                                                 sub_sample_factor= sub_sample_factor)
+        self.gate_block_2 = GridAttentionBlock2D(in_channels=in_size, gating_channels=gate_size,
+                                                 inter_channels=inter_size, mode=nonlocal_mode,
+                                                 sub_sample_factor=sub_sample_factor)
+        self.combine_gates = nn.Sequential(nn.Conv2d(in_size*2, in_size, kernel_size=1, stride=1, padding=0),
+                                           nn.BatchNorm2d(in_size),
+                                           nn.ReLU(inplace=True)
+                                           )
+
+        # initialise the blocks
+        for m in self.children():
+            if m.__class__.__name__.find('GridAttentionBlock3D') != -1: continue
+            init_weights(m, init_type='kaiming')
+
+    def forward(self, input, gating_signal):
+        gate_1, attention_1 = self.gate_block_1(input, gating_signal)
+        gate_2, attention_2 = self.gate_block_2(input, gating_signal)
+
+        return self.combine_gates(torch.cat([gate_1, gate_2], 1)), torch.cat([attention_1, attention_2], 1)
