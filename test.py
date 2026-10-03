@@ -162,7 +162,7 @@ def main():
             names = batch["name"]
 
             # Forward pass: take main output head
-            preds, _, _ = model(images)
+            preds, *rest = model(images)
 
             # Resize logits only when model output and label sizes differ.
             target_size = labels.shape[-2:]

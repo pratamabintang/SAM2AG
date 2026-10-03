@@ -71,11 +71,12 @@ def evaluate(model: torch.nn.Module, val_loader: DataLoader, device: torch.devic
                 dtype=amp_dtype,
                 enabled=amp_enabled,
             ):
-                out, out1, out2 = model(image)
+                out, out1, out2, out3 = model(image)
                 loss0 = structure_loss(out, target)
                 loss1 = structure_loss(out1, target)
                 loss2 = structure_loss(out2, target)
-                loss = loss0 + loss1 + loss2
+                loss3 = structure_loss(out3, target)
+                loss = loss0 + loss1 + loss2 + loss3
 
             total_loss += loss.item()
             total_iou += compute_iou(out, target)

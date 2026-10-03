@@ -563,7 +563,7 @@ def run_inference_on_sample(
     input_tensor = torch.cat([rgb_tensor, topo_tensor], dim=1)
 
     with torch.no_grad():
-        preds, _, _ = model(input_tensor)
+        preds, *rest = model(input_tensor)
         prob = torch.sigmoid(preds)[0, 0].cpu().numpy()
 
     # Resize kembali ke ukuran asli jika berbeda

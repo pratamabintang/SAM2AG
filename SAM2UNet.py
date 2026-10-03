@@ -173,10 +173,11 @@ class SAM2UNet(nn.Module):
         self.use_kan = use_kan
 
         model_cfg = "sam2_hiera_l.yaml"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         if checkpoint_path:
-            model = build_sam2(model_cfg, checkpoint_path)
+            model = build_sam2(model_cfg, checkpoint_path, device=device)
         else:
-            model = build_sam2(model_cfg)
+            model = build_sam2(model_cfg, device=device)
         del model.sam_mask_decoder
         del model.sam_prompt_encoder
         del model.memory_encoder
@@ -216,16 +217,6 @@ class SAM2UNet(nn.Module):
         # self.rfb3 = RFB_modified(576, 64)
         # self.rfb4 = RFB_modified(1152, 64)
 
-        self.proj1 = SkipFusion(filters[0] + topo_channels[0], filters[0])
-        self.proj2 = SkipFusion(filters[1] + topo_channels[1], filters[1])
-        self.proj3 = SkipFusion(filters[2] + topo_channels[2], filters[2])
-        self.proj4 = SkipFusion(filters[3] + topo_channels[3], filters[3])
-
-        # self.proj1 = SkipFusion(144 + topo_channels[0], 64)
-        # self.proj2 = SkipFusion(288 + topo_channels[1], 64)
-        # self.proj3 = SkipFusion(576 + topo_channels[2], 64)
-        # self.proj4 = SkipFusion(1152 + topo_channels[3], 64)
-
         # self.up1 = Up(128, 64, use_kan=use_kan)
         # self.up2 = Up(128, 64, use_kan=use_kan)
         # self.up3 = Up(128, 64, use_kan=use_kan)
@@ -235,6 +226,18 @@ class SAM2UNet(nn.Module):
         self.gating_rgb = UnetGridGatingSignal2(filters[4], filters[4], kernel_size=(1, 1), is_batchnorm=is_batchnorm)
         self.center_topo = UnetConv2(topo_channels[3], 1536, is_batchnorm)
         self.gating_topo = UnetGridGatingSignal2(1536, 1536, kernel_size=(1, 1), is_batchnorm=is_batchnorm)
+
+        self.proj1 = SkipFusion(filters[0] + topo_channels[0], filters[0])
+        self.proj2 = SkipFusion(filters[1] + topo_channels[1], filters[1])
+        self.proj3 = SkipFusion(filters[2] + topo_channels[2], filters[2])
+        self.proj4 = SkipFusion(filters[3] + topo_channels[3], filters[3])
+        self.proj5 = SkipFusion(1536 + 2304, 2304)
+        self.proj6 = SkipFusion(1536 + 2304, 2304)
+
+        # self.proj1 = SkipFusion(144 + topo_channels[0], 64)
+        # self.proj2 = SkipFusion(288 + topo_channels[1], 64)
+        # self.proj3 = SkipFusion(576 + topo_channels[2], 64)
+        # self.proj4 = SkipFusion(1152 + topo_channels[3], 64)
     
         # attention blocks
         self.attentionblock2 = GridAttentionBlock2D(in_channels=filters[1], gating_channels=filters[2],
@@ -255,7 +258,7 @@ class SAM2UNet(nn.Module):
         self.dsv4 = UnetDsv2(in_size=filters[3], out_size=1, scale_factor=32)
         self.dsv3 = UnetDsv2(in_size=filters[2], out_size=1, scale_factor=16)
         self.dsv2 = UnetDsv2(in_size=filters[1], out_size=1, scale_factor=8)
-        self.dsv2 = UnetDsv2(in_size=filters[0], out_size=1, scale_factor=4)
+        self.dsv1 = UnetDsv2(in_size=filters[0], out_size=1, scale_factor=4)
         # self.dsv1 = nn.Conv2d(in_channels=filters[0], out_channels=1, kernel_size=1)
 
     def forward(self, x, x_topo=None):
@@ -277,15 +280,19 @@ class SAM2UNet(nn.Module):
         topo_feats = self.topo_encoder(x_topo)
         t1, t2, t3, t4 = topo_feats[0], topo_feats[1], topo_feats[2], topo_feats[3]
 
+        # Gating Signal Generation
+        center_rgb = self.center_rgb(self.maxpool4_rgb(x4))
+        gating_rgb = self.gating_rgb(center_rgb)
+        center_topo = self.center_topo(self.maxpool4_topo(x4))
+        gating_topo = self.gating_topo(center_topo)
+
         # x1, x2, x3, x4 = self.rfb1(x1), self.rfb2(x2), self.rfb3(x3), self.rfb4(x4)
         x1 = self.proj1(x1, t1)
         x2 = self.proj2(x2, t2)
         x3 = self.proj3(x3, t3)
         x4 = self.proj4(x4, t4)
-
-        # Gating Signal Generation
-        center = self.center(x4)
-        gating = self.gating(center)
+        center = self.proj5(center_rgb, center_topo)
+        gating = self.proj6(gating_rgb, gating_topo)
 
         # Attention Mechanism
         # Upscaling Part (Decoder)
@@ -318,12 +325,12 @@ if __name__ == "__main__":
         # Example 1: 4-channel single tensor (3 RGB + 1 DTM)
         model = SAM2UNet(topo_in_chans=1, topo_backbone="convnext_tiny", pretrained_topo=False).to(device)
         x = torch.randn(1, 4, 512, 512).to(device)
-        out, out1, out2 = model(x)
-        print("Single tensor forward outputs:", out.shape, out1.shape, out2.shape)
+        out1, out2, out3, out4 = model(x)
+        print("Single tensor forward outputs:", out1.shape, out2.shape, out3.shape, out4.shape)
 
         # Example 2: Explicit two-stream forward (3 RGB and 5 Topo)
         model_custom = SAM2UNet(topo_in_chans=5, topo_backbone="convnext_nano", pretrained_topo=False).to(device)
         x_rgb = torch.randn(1, 3, 512, 512).to(device)
         x_topo = torch.randn(1, 5, 512, 512).to(device)
-        out, out1, out2 = model_custom(x_rgb, x_topo=x_topo)
-        print("Explicit two-stream forward outputs:", out.shape, out1.shape, out2.shape)
+        out1, out2, out3, out4 = model_custom(x_rgb, x_topo=x_topo)
+        print("Explicit two-stream forward outputs:", out1.shape, out2.shape, out3.shape, out4.shape)

@@ -34,7 +34,8 @@ def build_sam2(
     OmegaConf.resolve(cfg)
     model = instantiate(cfg.model, _recursive_=True)
     _load_checkpoint(model, ckpt_path)
-    model = model.to(device)
+    if device is not None:
+        model = model.to(device)
     if mode == "eval":
         model.eval()
     return model
