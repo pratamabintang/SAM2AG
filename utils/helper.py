@@ -42,6 +42,7 @@ def setup_logger(log_file: str) -> logging.Logger:
     logger = logging.getLogger("LandslideSAM2")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
+    logger.propagate = False
 
     # Console handler
     ch = logging.StreamHandler(sys.stdout)

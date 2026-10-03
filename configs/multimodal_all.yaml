@@ -23,7 +23,7 @@ model:
   hiera_path: "checkpoints/sam2_hiera_large.pt"
   topo_backbone: "convnext_tiny"
   pretrained_topo: true
-  use_kan: true
+  use_kan: false
 
 training:
   epochs: 20

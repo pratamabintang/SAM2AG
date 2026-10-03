@@ -208,6 +208,7 @@ class SAM2UNet(nn.Module):
         topo_channels = self.topo_encoder.feature_info.channels()
 
         filters = [144, 288, 576, 1152, 2304]
+        self.scale_factor = 4
 
         self.maxpool4_rgb = nn.MaxPool2d(kernel_size=(2, 2))
         self.maxpool4_topo = nn.MaxPool2d(kernel_size=(2, 2))
@@ -222,17 +223,17 @@ class SAM2UNet(nn.Module):
         # self.up3 = Up(128, 64, use_kan=use_kan)
         # self.up4 = Up(128, 64, use_kan=use_kan)  # Unused in 3-stage decoder
 
-        self.center_rgb = UnetConv2(filters[3], filters[4], is_batchnorm)
-        self.gating_rgb = UnetGridGatingSignal2(filters[4], filters[4], kernel_size=(1, 1), is_batchnorm=is_batchnorm)
-        self.center_topo = UnetConv2(topo_channels[3], 1536, is_batchnorm)
-        self.gating_topo = UnetGridGatingSignal2(1536, 1536, kernel_size=(1, 1), is_batchnorm=is_batchnorm)
+        self.center_rgb = UnetConv2(filters[3], filters[4] // self.scale_factor, is_batchnorm)
+        self.gating_rgb = UnetGridGatingSignal2(filters[4] // self.scale_factor, filters[4] // self.scale_factor, kernel_size=(1, 1), is_batchnorm=is_batchnorm)
+        self.center_topo = UnetConv2(topo_channels[3], 1536 // self.scale_factor, is_batchnorm)
+        self.gating_topo = UnetGridGatingSignal2(1536 // self.scale_factor, 1536 // self.scale_factor, kernel_size=(1, 1), is_batchnorm=is_batchnorm)
 
-        self.proj1 = SkipFusion(filters[0] + topo_channels[0], filters[0])
-        self.proj2 = SkipFusion(filters[1] + topo_channels[1], filters[1])
-        self.proj3 = SkipFusion(filters[2] + topo_channels[2], filters[2])
-        self.proj4 = SkipFusion(filters[3] + topo_channels[3], filters[3])
-        self.proj5 = SkipFusion(1536 + 2304, 2304)
-        self.proj6 = SkipFusion(1536 + 2304, 2304)
+        self.proj1 = SkipFusion(filters[0] + topo_channels[0], filters[0] // self.scale_factor)
+        self.proj2 = SkipFusion(filters[1] + topo_channels[1], filters[1] // self.scale_factor)
+        self.proj3 = SkipFusion(filters[2] + topo_channels[2], filters[2] // self.scale_factor)
+        self.proj4 = SkipFusion(filters[3] + topo_channels[3], filters[3] // self.scale_factor)
+        self.proj5 = SkipFusion(1536 // self.scale_factor + 2304 // self.scale_factor, 2304 // self.scale_factor)
+        self.proj6 = SkipFusion(1536 // self.scale_factor + 2304 // self.scale_factor, 2304 // self.scale_factor)
 
         # self.proj1 = SkipFusion(144 + topo_channels[0], 64)
         # self.proj2 = SkipFusion(288 + topo_channels[1], 64)
@@ -240,25 +241,25 @@ class SAM2UNet(nn.Module):
         # self.proj4 = SkipFusion(1152 + topo_channels[3], 64)
     
         # attention blocks
-        self.attentionblock2 = GridAttentionBlock2D(in_channels=filters[1], gating_channels=filters[2],
-                                                    inter_channels=filters[1], sub_sample_factor=attention_dsample, mode=mode)
-        self.attentionblock3 = GridAttentionBlock2D(in_channels=filters[2], gating_channels=filters[3],
-                                                    inter_channels=filters[2], sub_sample_factor=attention_dsample, mode=mode)
-        self.attentionblock4 = GridAttentionBlock2D(in_channels=filters[3], gating_channels=filters[4],
-                                                    inter_channels=filters[2], sub_sample_factor=attention_dsample, mode=mode)
+        self.attentionblock2 = GridAttentionBlock2D(in_channels=filters[1] // self.scale_factor, gating_channels=filters[2] // self.scale_factor,
+                                                    inter_channels=filters[1] // self.scale_factor, sub_sample_factor=attention_dsample, mode=mode)
+        self.attentionblock3 = GridAttentionBlock2D(in_channels=filters[2] // self.scale_factor, gating_channels=filters[3] // self.scale_factor,
+                                                    inter_channels=filters[2] // self.scale_factor, sub_sample_factor=attention_dsample, mode=mode)
+        self.attentionblock4 = GridAttentionBlock2D(in_channels=filters[3] // self.scale_factor, gating_channels=filters[4] // self.scale_factor,
+                                                    inter_channels=filters[3] // self.scale_factor, sub_sample_factor=attention_dsample, mode=mode)
 
-        self.up_concat4 = UnetUp2_CT(filters[4], filters[3], is_batchnorm)
-        self.up_concat3 = UnetUp2_CT(filters[3], filters[2], is_batchnorm)
-        self.up_concat2 = UnetUp2_CT(filters[2], filters[1], is_batchnorm)
-        self.up_concat1 = UnetUp2_CT(filters[1], filters[0], is_batchnorm)
+        self.up_concat4 = UnetUp2_CT(filters[4] // self.scale_factor, filters[3] // self.scale_factor, is_batchnorm)
+        self.up_concat3 = UnetUp2_CT(filters[3] // self.scale_factor, filters[2] // self.scale_factor, is_batchnorm)
+        self.up_concat2 = UnetUp2_CT(filters[2] // self.scale_factor, filters[1] // self.scale_factor, is_batchnorm)
+        self.up_concat1 = UnetUp2_CT(filters[1] // self.scale_factor, filters[0] // self.scale_factor, is_batchnorm)
 
         # self.side1 = nn.Conv2d(64, 1, kernel_size=1)
         # self.side2 = nn.Conv2d(64, 1, kernel_size=1)
         # self.head = nn.Conv2d(64, 1, kernel_size=1)
-        self.dsv4 = UnetDsv2(in_size=filters[3], out_size=1, scale_factor=32)
-        self.dsv3 = UnetDsv2(in_size=filters[2], out_size=1, scale_factor=16)
-        self.dsv2 = UnetDsv2(in_size=filters[1], out_size=1, scale_factor=8)
-        self.dsv1 = UnetDsv2(in_size=filters[0], out_size=1, scale_factor=4)
+        self.dsv4 = UnetDsv2(in_size=filters[3] // self.scale_factor, out_size=1, scale_factor=32)
+        self.dsv3 = UnetDsv2(in_size=filters[2] // self.scale_factor, out_size=1, scale_factor=16)
+        self.dsv2 = UnetDsv2(in_size=filters[1] // self.scale_factor, out_size=1, scale_factor=8)
+        self.dsv1 = UnetDsv2(in_size=filters[0] // self.scale_factor, out_size=1, scale_factor=4)
         # self.dsv1 = nn.Conv2d(in_channels=filters[0], out_channels=1, kernel_size=1)
 
     def forward(self, x, x_topo=None):
