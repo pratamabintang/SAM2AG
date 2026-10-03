@@ -301,8 +301,8 @@ class UnetUp3_CT(nn.Module):
 class UnetUp2_CT(nn.Module):
     def __init__(self, in_size, out_size, is_batchnorm=True):
         super(UnetUp2_CT, self).__init__()
-        self.conv = UnetConv2(in_size + out_size, out_size, is_batchnorm, kernel_size=(3,3), padding_size=(1,1))
-        self.up = nn.Upsample(scale_factor=(2, 2), mode='bilinear')
+        self.conv = UnetConv2(in_size + out_size, out_size, is_batchnorm)
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
 
         # initialise the blocks
         for m in self.children():
@@ -311,15 +311,9 @@ class UnetUp2_CT(nn.Module):
 
     def forward(self, inputs1, inputs2):
         outputs2 = self.up(inputs2)
-        offset = outputs2.size()[2] - inputs1.size()[2]
-        padding = [
-            offset // 2,
-            offset - offset // 2,
-            offset // 2,
-            offset - offset // 2
-        ]
-        outputs1 = F.pad(inputs1, padding)
-        return self.conv(torch.cat([outputs1, outputs2], 1))
+        if outputs2.shape[2:] != inputs1.shape[2:]:
+            outputs2 = F.interpolate(outputs2, size=inputs1.shape[2:], mode='bilinear', align_corners=True)
+        return self.conv(torch.cat([inputs1, outputs2], 1))
 
 
 # Squeeze-and-Excitation Network

@@ -283,7 +283,7 @@ class SAM2UNet(nn.Module):
         # Gating Signal Generation
         center_rgb = self.center_rgb(self.maxpool4_rgb(x4))
         gating_rgb = self.gating_rgb(center_rgb)
-        center_topo = self.center_topo(self.maxpool4_topo(x4))
+        center_topo = self.center_topo(self.maxpool4_topo(t4))
         gating_topo = self.gating_topo(center_topo)
 
         # x1, x2, x3, x4 = self.rfb1(x1), self.rfb2(x2), self.rfb3(x3), self.rfb4(x4)
