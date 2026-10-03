@@ -1,6 +1,8 @@
 import os
 import json
+import yaml
 import argparse
+from typing import Dict, Any, List
 
 import numpy as np
 import torch
@@ -8,6 +10,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from PIL import Image
 from tqdm import tqdm
+from sklearn.metrics import average_precision_score
 
 from dataset import LandslideDataset
 from SAM2UNet import SAM2UNet
@@ -32,7 +35,7 @@ def parse_args():
 def calculate_metrics(pred_prob: np.ndarray, gt_binary: np.ndarray, threshold: float = 0.5):
     """
     Computes standard segmentation metrics:
-    IoU, Dice/F1, Precision, Recall, MAE.
+    IoU, Dice/F1, Precision, Recall, MAE, and mAP (Average Precision / PR-AUC).
     """
     pred_bin = (pred_prob >= threshold).astype(np.float32)
     gt = gt_binary.astype(np.float32)
@@ -49,12 +52,26 @@ def calculate_metrics(pred_prob: np.ndarray, gt_binary: np.ndarray, threshold: f
     recall = (tp + 1e-7) / (tp + fn + 1e-7)
     mae = np.mean(np.abs(pred_prob - gt))
 
+    gt_flat = gt.flatten().astype(np.int32)
+    prob_flat = pred_prob.flatten().astype(np.float32)
+    pos_count = int(gt_flat.sum())
+    if pos_count == 0:
+        ap = 1.0 if np.all(prob_flat < threshold) else 0.0
+    elif pos_count == len(gt_flat):
+        ap = 1.0 if np.all(prob_flat >= threshold) else 0.0
+    else:
+        try:
+            ap = float(average_precision_score(gt_flat, prob_flat))
+        except Exception:
+            ap = 0.0
+
     return {
         "iou": float(iou),
         "dice": float(dice),
         "precision": float(precision),
         "recall": float(recall),
         "mae": float(mae),
+        "map": float(ap),
     }
 
 
@@ -74,8 +91,11 @@ def main():
         run_parent = os.path.dirname(ckpt_dir)
         save_dir = os.path.join(run_parent, f"{args.split}_results")
 
-    pred_dir = os.path.join(save_dir, "predictions")
-    os.makedirs(pred_dir, exist_ok=True)
+    probability_dir = os.path.join(save_dir, "probability_maps")
+    binary_dir = os.path.join(save_dir, "binary_masks")
+    if args.save_masks:
+        os.makedirs(probability_dir, exist_ok=True)
+        os.makedirs(binary_dir, exist_ok=True)
     print(f"Results and predictions will be saved to: {save_dir}")
 
     # Dataset & Dataloader
@@ -107,19 +127,28 @@ def main():
 
     # Model initialization
     topo_in_chans = sum(1 for m in modalities if m != "IMAGE")
-    m_cfg = config["model"]
+    m_cfg = config.get("model", {})
     topo_backbone = m_cfg.get("topo_backbone", "convnext_tiny")
     use_kan = m_cfg.get("use_kan", True)
 
+    print(f"Loading checkpoint weights from: {args.checkpoint}")
+    state_dict = torch.load(args.checkpoint, map_location=device)
+    if "state_dict" in state_dict and isinstance(state_dict["state_dict"], dict):
+        state_dict = state_dict["state_dict"]
+
+    if any("kan." in k for k in state_dict.keys()):
+        use_kan = True
+
     model = SAM2UNet(
         checkpoint_path=None,
+        mode = 'concatenation',
+        attention_dsample = (2, 2),
+        is_batchnorm = True,
         topo_in_chans=max(1, topo_in_chans),
         topo_backbone=topo_backbone,
         pretrained_topo=False,
         use_kan=use_kan,
     )
-    print(f"Loading checkpoint weights from: {args.checkpoint}")
-    state_dict = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(state_dict, strict=True)
     model.to(device)
     model.eval()
@@ -135,10 +164,17 @@ def main():
             # Forward pass: take main output head
             preds, _, _ = model(images)
 
-            # Upsample prediction back to original ground truth resolution (512, 512)
-            orig_h = labels.shape[2]
-            orig_w = labels.shape[3]
-            preds_upsampled = F.interpolate(preds, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+            # Resize logits only when model output and label sizes differ.
+            target_size = labels.shape[-2:]
+            if preds.shape[-2:] != target_size:
+                preds_upsampled = F.interpolate(
+                    preds,
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            else:
+                preds_upsampled = preds
             pred_probs = torch.sigmoid(preds_upsampled).cpu().numpy()
 
             for i in range(len(names)):
@@ -150,10 +186,17 @@ def main():
                 all_metrics.append(m)
 
                 if args.save_masks:
-                    # Save probability mask scaled to [0, 255]
-                    out_img = (prob * 255.0).clip(0, 255).astype(np.uint8)
-                    save_path = os.path.join(pred_dir, f"{name}.png")
-                    Image.fromarray(out_img).save(save_path)
+                    # Soft probability map: useful for calibration/inspection.
+                    probability_img = (prob * 255.0).clip(0, 255).astype(np.uint8)
+                    Image.fromarray(probability_img).save(
+                        os.path.join(probability_dir, f"{name}.png")
+                    )
+
+                    # Crisp binary mask: threshold is applied to the saved image.
+                    binary_img = (prob >= args.threshold).astype(np.uint8) * 255
+                    Image.fromarray(binary_img).save(
+                        os.path.join(binary_dir, f"{name}.png")
+                    )
 
     # Compute mean metrics across all samples
     avg_metrics = {

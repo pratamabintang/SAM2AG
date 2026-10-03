@@ -26,6 +26,18 @@ def seed_everything(seed: int = 1024):
         torch.backends.cudnn.deterministic = True
 
 
+def seed_worker(worker_id: int):
+    worker_info = torch.utils.data.get_worker_info()
+    seed = worker_info.seed % 2**32
+    np.random.seed(seed)
+    random.seed(seed)
+    try:
+        import cv2
+        cv2.setLogLevel(0)
+    except Exception:
+        pass
+
+
 def setup_logger(log_file: str) -> logging.Logger:
     logger = logging.getLogger("LandslideSAM2")
     logger.setLevel(logging.INFO)

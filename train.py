@@ -14,7 +14,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from dataset import LandslideDataset
 from SAM2UNet import SAM2UNet
 
-from utils.helper import load_config, seed_everything, setup_logger
+from utils.helper import load_config, seed_everything, setup_logger, seed_worker
 
 
 def parse_args():
@@ -33,12 +33,14 @@ def parse_args():
 
 def structure_loss(pred: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Structure loss: Weighted Binary Cross-Entropy + Weighted IoU."""
+    pred = pred.float()
+    mask = mask.float()
     weit = 1 + 5 * torch.abs(F.avg_pool2d(mask, kernel_size=31, stride=1, padding=15) - mask)
     wbce = F.binary_cross_entropy_with_logits(pred, mask, reduction="none")
-    wbce = (weit * wbce).sum(dim=(2, 3)) / weit.sum(dim=(2, 3))
-    pred = torch.sigmoid(pred)
-    inter = ((pred * mask) * weit).sum(dim=(2, 3))
-    union = ((pred + mask) * weit).sum(dim=(2, 3))
+    wbce = (weit * wbce).sum(dim=(2, 3)) / (weit.sum(dim=(2, 3)) + 1e-8)
+    pred_sig = torch.sigmoid(pred)
+    inter = ((pred_sig * mask) * weit).sum(dim=(2, 3))
+    union = ((pred_sig + mask) * weit).sum(dim=(2, 3))
     wiou = 1 - (inter + 1) / (union - inter + 1)
     return (wbce + wiou).mean()
 
@@ -53,7 +55,7 @@ def compute_iou(pred: torch.Tensor, mask: torch.Tensor, threshold: float = 0.5) 
     return inter / (union + 1e-7)
 
 
-def evaluate(model: torch.nn.Module, val_loader: DataLoader, device: torch.device) -> Dict[str, float]:
+def evaluate(model: torch.nn.Module, val_loader: DataLoader, device: torch.device, amp_enabled: bool = False, amp_dtype: torch.dtype = torch.float16) -> Dict[str, float]:
     """Runs evaluation on validation split."""
     model.eval()
     total_loss = 0.0
@@ -62,13 +64,18 @@ def evaluate(model: torch.nn.Module, val_loader: DataLoader, device: torch.devic
 
     with torch.no_grad():
         for batch in val_loader:
-            image = batch["image"].to(device)
-            target = batch["label"].to(device)
-            out, out1, out2 = model(image)
-            loss0 = structure_loss(out, target)
-            loss1 = structure_loss(out1, target)
-            loss2 = structure_loss(out2, target)
-            loss = loss0 + loss1 + loss2
+            image = batch["image"].to(device, non_blocking=True)
+            target = batch["label"].to(device, non_blocking=True)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype,
+                enabled=amp_enabled,
+            ):
+                out, out1, out2 = model(image)
+                loss0 = structure_loss(out, target)
+                loss1 = structure_loss(out1, target)
+                loss2 = structure_loss(out2, target)
+                loss = loss0 + loss1 + loss2
 
             total_loss += loss.item()
             total_iou += compute_iou(out, target)
@@ -160,6 +167,9 @@ def main():
     train_workers = num_workers if (device.type == "cuda" and os.name != "nt") else min(num_workers, 2)
     pin_memory = (device.type == "cuda")
 
+    g = torch.Generator()
+    g.manual_seed(seed)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -167,6 +177,8 @@ def main():
         num_workers=train_workers,
         pin_memory=pin_memory,
         drop_last=True if len(train_dataset) > batch_size else False,
+        worker_init_fn=seed_worker,
+        generator=g,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -174,6 +186,7 @@ def main():
         shuffle=False,
         num_workers=train_workers,
         pin_memory=pin_memory,
+        worker_init_fn=seed_worker,
     )
 
     logger.info(f"Train Samples: {len(train_dataset)} | Val Samples: {len(val_dataset)}")
@@ -189,9 +202,12 @@ def main():
     pretrained_topo = m_cfg.get("pretrained_topo", True)
     use_kan = m_cfg.get("use_kan", True)
 
-    logger.info(f"Initializing SAM2UNet (Topo: {topo_backbone}, Pretrained: {pretrained_topo}, KAN Decoder: {use_kan})...")
+    logger.info(f"Initializing SAM2UNet (Topo: {topo_backbone}, Pretrained: {pretrained_topo}, KAN Decoder: {use_kan}")
     model = SAM2UNet(
         checkpoint_path=hiera_path if (hiera_path and os.path.exists(hiera_path)) else None,
+        mode="concatenation",
+        attention_dsample = (2, 2),
+        is_batchnorm = True,
         topo_in_chans=max(1, topo_in_chans),
         topo_backbone=topo_backbone,
         pretrained_topo=pretrained_topo,
@@ -214,6 +230,39 @@ def main():
     optimizer = opt.AdamW(trainable_params, lr=lr, weight_decay=weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=min_lr)
 
+    # Memory-safe training controls for GPU precision and accumulation.
+    amp_enabled = bool(t_cfg.get("amp", True)) and device.type == "cuda"
+    grad_accum_steps = max(1, int(t_cfg.get("grad_accum_steps", 1)))
+    grad_clip = float(t_cfg.get("grad_clip", 1.0))
+
+    # Precision configuration: support auto/bfloat16 on SM80+ (Blackwell, Hopper, Ada, Ampere)
+    amp_dtype_str = str(t_cfg.get("amp_dtype", "auto")).lower()
+    if amp_dtype_str in ("bfloat16", "bf16"):
+        amp_dtype = torch.bfloat16
+    elif amp_dtype_str in ("float16", "fp16"):
+        amp_dtype = torch.float16
+    else:  # auto
+        if device.type == "cuda" and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            amp_dtype = torch.bfloat16
+        else:
+            amp_dtype = torch.float16
+
+    use_scaler = amp_enabled and (amp_dtype == torch.float16)
+
+    # torch.amp is preferred on current PyTorch; fallback keeps compatibility
+    # with older versions allowed by requirements.txt.
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+    except (AttributeError, TypeError):
+        scaler = torch.amp.GradScaler(enabled=use_scaler)
+
+    logger.info(
+        f"AMP: {amp_enabled} (dtype: {amp_dtype}) | Scaler: {use_scaler} "
+        f"| Gradient accumulation: {grad_accum_steps} "
+        f"| Effective batch size: {batch_size * grad_accum_steps} "
+        f"| Gradient clip: {grad_clip}"
+    )
+
     best_val_iou = -1.0
     start_time = time.time()
 
@@ -221,26 +270,42 @@ def main():
         model.train()
         epoch_loss = 0.0
         step_count = 0
+        optimizer.zero_grad(set_to_none=True)
 
         for i, batch in enumerate(train_loader):
-            image = batch["image"].to(device)
-            target = batch["label"].to(device)
+            image = batch["image"].to(device, non_blocking=True)
+            target = batch["label"].to(device, non_blocking=True)
 
-            optimizer.zero_grad()
-            out, out1, out2, out3 = model(image)
-            loss0 = structure_loss(out, target)
-            loss1 = structure_loss(out1, target)
-            loss2 = structure_loss(out2, target)
-            loss3 = structure_loss(out3, target)
-            loss = loss0 + loss1 + loss2 + loss3
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype,
+                enabled=amp_enabled,
+            ):
+                out, out1, out2, out3 = model(image)
+                loss0 = structure_loss(out, target)
+                loss1 = structure_loss(out1, target)
+                loss2 = structure_loss(out2, target)
+                loss3 = structure_loss(out3, target)
+                loss = loss0 + loss1 + loss2 + loss3
 
-            loss.backward()
-            optimizer.step()
+            # Correct scaling for the final partial accumulation group.
+            group_start = (i // grad_accum_steps) * grad_accum_steps
+            group_size = min(grad_accum_steps, len(train_loader) - group_start)
+            scaler.scale(loss / group_size).backward()
+
+            should_step = ((i + 1) % grad_accum_steps == 0) or ((i + 1) == len(train_loader))
+            if should_step:
+                if grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
             epoch_loss += loss.item()
             step_count += 1
 
-            if (i == 0) or (i + 1) % 10 == 0 or (i + 1) == len(train_loader):
+            if (i + 1) % 20 == 0 or (i + 1) == len(train_loader):
                 logger.info(
                     f"Epoch [{epoch}/{epochs}] Step [{i+1}/{len(train_loader)}] - "
                     f"Batch Loss: {loss.item():.4f} - LR: {optimizer.param_groups[0]['lr']:.6f}"
@@ -252,7 +317,7 @@ def main():
 
         # Evaluation phase
         if epoch % eval_interval == 0:
-            val_metrics = evaluate(model, val_loader, device)
+            val_metrics = evaluate(model, val_loader, device, amp_enabled=amp_enabled, amp_dtype=amp_dtype)
             val_loss = val_metrics["val_loss"]
             val_iou = val_metrics["val_iou"]
             logger.info(f"Validation - Loss: {val_loss:.4f} | IoU: {val_iou:.4f}")

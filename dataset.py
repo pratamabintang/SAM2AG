@@ -4,19 +4,34 @@ from typing import List, Optional, Tuple, Dict, Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
 from torch.utils.data import Dataset
 from PIL import Image
 import cv2
 
+try:
+    cv2.setLogLevel(0)
+except Exception:
+    pass
+
 
 def load_blacklist(blacklist_path: Optional[str]) -> set:
     """Loads sample identifiers to ignore from a blacklist text file."""
-    if not blacklist_path or not os.path.exists(blacklist_path):
+    if not blacklist_path or str(blacklist_path).lower() in ("none", "null", ""):
         return set()
+    if not os.path.exists(blacklist_path):
+        return set()
+    blacklist = set()
     with open(blacklist_path, "r", encoding="utf-8") as f:
-        return set(line.strip() for line in f if line.strip())
+        for line in f:
+            clean = line.strip()
+            if not clean or clean.startswith("#"):
+                continue
+            stem, _ = os.path.splitext(clean)
+            blacklist.add(stem)
+    return blacklist
 
 
 class LandslideDataset(Dataset):
@@ -156,9 +171,8 @@ class LandslideDataset(Dataset):
             if not os.path.exists(file_path):
                 raise FileNotFoundError(f"File for modality '{modality}' not found for sample '{sample_name}'")
 
-        img = Image.open(file_path)
-
         if modality == "IMAGE":
+            img = Image.open(file_path)
             rgb_arr = np.array(img.convert("RGB"), dtype=np.uint8)
             if self.mode == "train":
                 rgb_arr = self._apply_photometric_augmentations(rgb_arr)
@@ -166,14 +180,39 @@ class LandslideDataset(Dataset):
             tensor = TF.normalize(tensor, mean=self.IMAGENET_MEAN, std=self.IMAGENET_STD)
             return tensor
 
-        arr = np.array(img, dtype=np.float32)
+        arr = None
+        try:
+            with Image.open(file_path) as img:
+                arr = np.array(img, dtype=np.float32)
+                if arr.ndim == 3:
+                    arr = arr[:, :, 0]
+        except Exception:
+            pass
+
+        if arr is None:
+            try:
+                cv_img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+                if cv_img is not None:
+                    if cv_img.ndim == 3:
+                        cv_img = cv_img[:, :, 0]
+                    arr = cv_img.astype(np.float32)
+            except Exception:
+                pass
 
         if modality == "DTM":
             # Per-tile Min-Max Normalization: captures relative local topography
-            val_min = float(arr.min())
-            val_max = float(arr.max())
+            if np.isnan(arr).any() or np.isinf(arr).any():
+                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+            valid_mask = (arr > -1000.0) & (arr < 10000.0)
+            if valid_mask.any():
+                val_min = float(arr[valid_mask].min())
+                val_max = float(arr[valid_mask].max())
+            else:
+                val_min, val_max = 0.0, 0.0
+
             if val_max > val_min:
-                norm_arr = (arr - val_min) / (val_max - val_min)
+                norm_arr = np.clip((arr - val_min) / (val_max - val_min), 0.0, 1.0)
             else:
                 norm_arr = np.zeros_like(arr)
             return torch.from_numpy(norm_arr).unsqueeze(0)  # Shape (1, H, W)
