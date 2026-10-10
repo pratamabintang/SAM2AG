@@ -18,19 +18,42 @@ except Exception:
 
 
 def load_blacklist(blacklist_path: Optional[str]) -> set:
-    """Loads sample identifiers to ignore from a blacklist text file."""
+    """Loads sample identifiers to ignore from a blacklist text file with fallback search."""
     if not blacklist_path or str(blacklist_path).lower() in ("none", "null", ""):
         return set()
-    if not os.path.exists(blacklist_path):
+
+    resolved_path = None
+    if os.path.exists(blacklist_path):
+        resolved_path = blacklist_path
+    else:
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates = [
+            os.path.join(module_dir, str(blacklist_path)),
+            os.path.join(module_dir, "datasets", "landslide", "black_list.txt"),
+            os.path.join(os.getcwd(), str(blacklist_path)),
+            os.path.join(os.getcwd(), "datasets", "landslide", "black_list.txt"),
+            "/content/drive/MyDrive/project/black_list.txt",
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                resolved_path = c
+                break
+
+    if not resolved_path or not os.path.exists(resolved_path):
         return set()
+
     blacklist = set()
-    with open(blacklist_path, "r", encoding="utf-8") as f:
+    with open(resolved_path, "r", encoding="utf-8") as f:
         for line in f:
             clean = line.strip()
             if not clean or clean.startswith("#"):
                 continue
-            stem, _ = os.path.splitext(clean)
+            clean = clean.split("#")[0].strip()
+            if not clean:
+                continue
+            stem, _ = os.path.splitext(os.path.basename(clean))
             blacklist.add(stem)
+            blacklist.add(clean)
     return blacklist
 
 
@@ -94,14 +117,19 @@ class LandslideDataset(Dataset):
 
         all_files = sorted(os.listdir(image_dir))
         self.samples = []
+        skipped_blacklist = 0
         for f in all_files:
             base_name, _ = os.path.splitext(f)
-            if base_name in self.blacklist:
+            if base_name in self.blacklist or f in self.blacklist:
+                skipped_blacklist += 1
                 continue
             self.samples.append(base_name)
 
+        if skipped_blacklist > 0:
+            print(f"[{self.split.upper()}] Blacklist aktif: {skipped_blacklist} sampel gambar/topografi rusak dilewati.")
+
         if len(self.samples) == 0:
-            raise RuntimeError(f"No valid samples found in {self.split_dir} (total files: {len(all_files)})")
+            raise RuntimeError(f"No valid samples found in {self.split_dir} (total files: {len(all_files)}, skipped blacklist: {skipped_blacklist})")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -172,8 +200,16 @@ class LandslideDataset(Dataset):
                 raise FileNotFoundError(f"File for modality '{modality}' not found for sample '{sample_name}'")
 
         if modality == "IMAGE":
-            img = Image.open(file_path)
-            rgb_arr = np.array(img.convert("RGB"), dtype=np.uint8)
+            try:
+                img = Image.open(file_path)
+                rgb_arr = np.array(img.convert("RGB"), dtype=np.uint8)
+            except Exception:
+                cv_img = cv2.imread(file_path)
+                if cv_img is not None:
+                    rgb_arr = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+                else:
+                    rgb_arr = np.zeros((self.target_size, self.target_size, 3), dtype=np.uint8)
+
             if self.mode == "train":
                 rgb_arr = self._apply_photometric_augmentations(rgb_arr)
             tensor = TF.to_tensor(rgb_arr)  # Shape (3, H, W), range [0, 1]
@@ -199,11 +235,15 @@ class LandslideDataset(Dataset):
             except Exception:
                 pass
 
+        if arr is None:
+            arr = np.zeros((self.target_size, self.target_size), dtype=np.float32)
+
+        # Sanitize NaNs/Infs for all topography modalities (topography rusak)
+        if np.isnan(arr).any() or np.isinf(arr).any():
+            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
         if modality == "DTM":
             # Per-tile Min-Max Normalization: captures relative local topography
-            if np.isnan(arr).any() or np.isinf(arr).any():
-                arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-
             valid_mask = (arr > -1000.0) & (arr < 10000.0)
             if valid_mask.any():
                 val_min = float(arr[valid_mask].min())
@@ -248,8 +288,16 @@ class LandslideDataset(Dataset):
             if not os.path.exists(label_path):
                 raise FileNotFoundError(f"Label file not found for sample '{sample_name}'")
 
-        img = Image.open(label_path)
-        arr = np.array(img)
+        try:
+            img = Image.open(label_path)
+            arr = np.array(img)
+        except Exception:
+            cv_img = cv2.imread(label_path, cv2.IMREAD_UNCHANGED)
+            if cv_img is not None:
+                arr = cv_img
+            else:
+                arr = np.zeros((self.target_size, self.target_size), dtype=np.float32)
+
         # Landslide is 255 (or > 0), background is 0
         bin_arr = (arr > 0).astype(np.float32)
         return torch.from_numpy(bin_arr).unsqueeze(0)  # Shape (1, H, W)

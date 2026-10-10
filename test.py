@@ -107,12 +107,12 @@ def main():
         blacklist_path = None
     target_size = ds_cfg.get("size", 352)
 
-    if blacklist_path and os.path.exists(blacklist_path):
-        from dataset import load_blacklist
-        bl_set = load_blacklist(blacklist_path)
-        print(f"Blacklist active: {len(bl_set)} corrupted/noisy samples will be skipped from '{blacklist_path}'")
+    from dataset import load_blacklist
+    bl_set = load_blacklist(blacklist_path)
+    if bl_set:
+        print(f"Blacklist active: {len(bl_set)} corrupted/noisy samples will be skipped from blacklist.")
     elif blacklist_path:
-        print(f"Notice: Blacklist path specified but file not found: {blacklist_path}")
+        print(f"Notice: Blacklist path '{blacklist_path}' specified but no samples loaded.")
 
     dataset = LandslideDataset(
         data_dir=data_dir,
